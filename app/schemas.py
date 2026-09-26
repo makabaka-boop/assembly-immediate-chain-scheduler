@@ -46,11 +46,27 @@ class EdgeIn(BaseModel):
         return _ascii_nonempty(v, info.field_name)
 
 
+class ImmediateIn(BaseModel):
+    """Directed pair: ``after`` must directly follow ``before`` (no order
+    may be scheduled in between)."""
+
+    model_config = pydantic.ConfigDict(extra="forbid")
+
+    before: str
+    after: str
+
+    @pydantic.field_validator("before", "after")
+    @classmethod
+    def _ascii_nonempty(cls, v: str, info: pydantic.ValidationInfo) -> str:
+        return _ascii_nonempty(v, info.field_name)
+
+
 class ScheduleRequest(BaseModel):
     model_config = pydantic.ConfigDict(extra="forbid")
 
     jobs: list[JobIn] = Field(..., min_length=MIN_JOBS, max_length=MAX_JOBS)
     edges: list[EdgeIn] = Field(default_factory=list)
+    immediate: list[ImmediateIn] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _validate(self) -> "ScheduleRequest":
@@ -72,4 +88,25 @@ class ScheduleRequest(BaseModel):
             if (before, after) in seen:
                 raise ValueError("duplicate edge")
             seen.add((before, after))
+
+        # Immediate pairs must chain up: every order has at most one
+        # immediate predecessor and one immediate successor.
+        seen_imm: set[tuple[str, str]] = set()
+        imm_succ: dict[str, str] = {}
+        imm_pred: dict[str, str] = {}
+        for pair in self.immediate:
+            before, after = pair.before, pair.after
+            if before not in known or after not in known:
+                raise ValueError("immediate pair references unknown job id")
+            if before == after:
+                raise ValueError("self immediate pairs are not allowed")
+            if (before, after) in seen_imm:
+                raise ValueError("duplicate immediate pair")
+            seen_imm.add((before, after))
+            if before in imm_succ:
+                raise ValueError("job has multiple immediate successors")
+            if after in imm_pred:
+                raise ValueError("job has multiple immediate predecessors")
+            imm_succ[before] = after
+            imm_pred[after] = before
         return self

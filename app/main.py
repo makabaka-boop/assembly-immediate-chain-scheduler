@@ -9,11 +9,12 @@ from .schemas import ScheduleRequest
 
 app = FastAPI(
     title="Low-Changeover Assembly Line Scheduler",
-    version="1.0.0",
+    version="1.1.0",
     description=(
-        "Orders work orders so that all precedence edges are satisfied, "
-        "the number of recipe-family changeovers is minimised, and the "
-        "result is lexicographically smallest (UTF-8 byte order)."
+        "Orders work orders so that all precedence edges and immediate "
+        "(directly-follows) pairs are satisfied, the number of recipe-family "
+        "changeovers is minimised, and the result is lexicographically "
+        "smallest (UTF-8 byte order)."
     ),
 )
 
@@ -27,4 +28,5 @@ def health() -> dict:
 def schedule(request: ScheduleRequest) -> dict:
     jobs = [Job(id=j.id, family=j.family) for j in request.jobs]
     edges = [(e.before, e.after) for e in request.edges]
-    return solve(jobs, edges)
+    immediate = [(p.before, p.after) for p in request.immediate]
+    return solve(jobs, edges, immediate)
