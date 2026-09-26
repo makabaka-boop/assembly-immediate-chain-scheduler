@@ -196,3 +196,184 @@ def test_edges_are_optional() -> None:
     data = resp.json()
     assert data["order"] == ["a", "b"]
     assert data["changeover_count"] == 0
+
+
+# --------------------------------------------------------------------------
+# immediate adjacency pairs
+# --------------------------------------------------------------------------
+
+
+def test_immediate_basic_success() -> None:
+    body = {
+        "jobs": [
+            {"id": "a", "family": "X"},
+            {"id": "b", "family": "Y"},
+            {"id": "c", "family": "X"},
+        ],
+        "edges": [],
+        "immediate": [{"before": "a", "after": "c"}],
+    }
+    resp = post(body)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["status"] == "OK"
+    assert data["order"] == ["a", "c", "b"]
+    assert data["changeover_count"] == 1
+
+
+def test_immediate_optional_empty_equals_omitted() -> None:
+    base = {
+        "jobs": [
+            {"id": "a", "family": "X"},
+            {"id": "b", "family": "Y"},
+        ],
+        "edges": [{"before": "a", "after": "b"}],
+    }
+    omitted = post(base).json()
+    empty = post({**base, "immediate": []}).json()
+    assert omitted == empty
+
+
+def test_unschedulable_response_has_no_partial_schedule() -> None:
+    body = {
+        "jobs": [
+            {"id": "a", "family": "X"},
+            {"id": "b", "family": "Y"},
+            {"id": "c", "family": "X"},
+        ],
+        "edges": [
+            {"before": "a", "after": "b"},
+            {"before": "b", "after": "c"},
+        ],
+        "immediate": [{"before": "a", "after": "c"}],
+    }
+    resp = post(body)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data == {"status": "UNSCHEDULABLE"}
+
+
+def test_self_immediate_pair_is_unschedulable_not_422() -> None:
+    body = {
+        "jobs": [{"id": "a", "family": "X"}, {"id": "b", "family": "Y"}],
+        "immediate": [{"before": "a", "after": "a"}],
+    }
+    resp = post(body)
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "UNSCHEDULABLE"}
+
+
+def test_cycle_with_immediate_still_cycle() -> None:
+    body = {
+        "jobs": [
+            {"id": "a", "family": "X"},
+            {"id": "b", "family": "Y"},
+            {"id": "c", "family": "Z"},
+        ],
+        "edges": [
+            {"before": "a", "after": "b"},
+            {"before": "b", "after": "c"},
+            {"before": "c", "after": "a"},
+        ],
+        "immediate": [{"before": "a", "after": "b"}],
+    }
+    resp = post(body)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "CYCLE"
+    assert data["cycle"] == ["a", "b", "c"]
+    assert "order" not in data
+
+
+def test_rejects_unknown_immediate_reference() -> None:
+    _expect_422(
+        {
+            "jobs": [{"id": "a", "family": "X"}, {"id": "b", "family": "Y"}],
+            "immediate": [{"before": "a", "after": "zzz"}],
+        }
+    )
+
+
+def test_rejects_duplicate_immediate_pair() -> None:
+    _expect_422(
+        {
+            "jobs": [
+                {"id": "a", "family": "X"},
+                {"id": "b", "family": "Y"},
+                {"id": "c", "family": "Z"},
+            ],
+            "immediate": [
+                {"before": "a", "after": "b"},
+                {"before": "a", "after": "b"},
+            ],
+        }
+    )
+
+
+def test_rejects_immediate_successor_fork() -> None:
+    _expect_422(
+        {
+            "jobs": [
+                {"id": "a", "family": "X"},
+                {"id": "b", "family": "Y"},
+                {"id": "c", "family": "Z"},
+            ],
+            "immediate": [
+                {"before": "a", "after": "b"},
+                {"before": "a", "after": "c"},
+            ],
+        }
+    )
+
+
+def test_rejects_immediate_predecessor_fork() -> None:
+    _expect_422(
+        {
+            "jobs": [
+                {"id": "a", "family": "X"},
+                {"id": "b", "family": "Y"},
+                {"id": "c", "family": "Z"},
+            ],
+            "immediate": [
+                {"before": "a", "after": "c"},
+                {"before": "b", "after": "c"},
+            ],
+        }
+    )
+
+
+def test_rejects_bad_immediate_pair_shape() -> None:
+    _expect_422(
+        {
+            "jobs": [{"id": "a", "family": "X"}, {"id": "b", "family": "Y"}],
+            "immediate": [{"before": "a"}],
+        }
+    )
+    _expect_422(
+        {
+            "jobs": [{"id": "a", "family": "X"}, {"id": "b", "family": "Y"}],
+            "immediate": [{"before": "a", "after": "b", "tight": True}],
+        }
+    )
+    _expect_422(
+        {
+            "jobs": [{"id": "a", "family": "X"}, {"id": "b", "family": "Y"}],
+            "immediate": {},
+        }
+    )
+
+
+def test_immediate_pair_does_not_share_duplicate_rule_with_edges() -> None:
+    # The same ordered pair appearing once as an ordinary edge and once as an
+    # immediate pair is legal (they express different requirements).
+    body = {
+        "jobs": [
+            {"id": "a", "family": "X"},
+            {"id": "b", "family": "Y"},
+        ],
+        "edges": [{"before": "a", "after": "b"}],
+        "immediate": [{"before": "a", "after": "b"}],
+    }
+    resp = post(body)
+    assert resp.status_code == 200
+    assert resp.json()["order"] == ["a", "b"]

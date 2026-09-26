@@ -1,25 +1,34 @@
 """Exact low-changeover topological scheduler.
 
-Given work orders (id, family) and ``before -> after`` precedence edges, find
-a topological ordering that
+Given work orders (id, family), ordinary ``before -> after`` precedence
+edges and optional *immediate* pairs demanding adjacent execution, find a
+complete ordering that
 
-1. satisfies every precedence edge,
+1. satisfies every precedence edge and every immediate adjacency,
 2. minimises the number of changeovers (positions where adjacent orders have
    different families; the first order never counts),
 3. among all optimal orderings, is lexicographically smallest on the order's
    UTF-8 byte sequences.
 
-The optimiser is a subset dynamic program::
+Immediate pairs give each job at most one fixed predecessor and one fixed
+successor; well-formed pairs therefore form disjoint chains.  The fixed
+chains and the inter-chain precedence edges are decided *together*: every
+chain is contracted into one indivisible block, ordinary precedence edges
+become constraints between blocks (edges pointing "backwards" inside one
+block are impossible), and the optimiser orders the blocks directly.  There
+is no "solve first, move later" repair step.
 
-    dp(mask, f) = minimum remaining changeovers when the orders in *mask*
+The optimiser is a subset dynamic program over blocks::
+
+    dp(mask, f) = minimum remaining changeovers when the blocks in *mask*
                   have already been placed and the family of the last placed
-                  order is *f*.
+                  order (the tail family of the last block) is *f*.
 
-With at most 18 orders there are 2**18 * 18 states, stored as a flat
+With at most 18 orders there are at most 2**18 * 18 states, stored as a flat
 ``bytearray`` (max cost is 17, ``INF = 0x7F``).  The lexicographically
-smallest optimum is then reconstructed greedily: at every step, try the
-available next orders in ascending UTF-8 id order and pick the first one
-that can still attain the DP optimum.
+smallest optimum is then reconstructed greedily: blocks are tried in
+ascending order of their first job id (UTF-8 byte order) and the first one
+that can still attain the DP optimum is chosen.
 """
 
 from __future__ import annotations
@@ -94,49 +103,59 @@ def find_cycle(jobs: list[Job], edges: list[tuple[str, str]]) -> list[str] | Non
     return [order[v] for v in best]
 
 
-def _optimal_order(
-    n: int,
-    family: list[int],
+def _optimal_block_order(
+    m: int,
+    first_family: list[int],
+    last_family: list[int],
     num_families: int,
-    prereq: list[int],
+    prereq_block: list[int],
+    block_entry_changeovers: list[int],
 ) -> list[int]:
-    """DP over subsets; returns the sequence of job indices."""
-    size = 1 << n
+    """DP over subsets of immediate-chain blocks; returns block indices.
+
+    Placing a block *b* after a placed order of family *f* costs
+    ``block_entry_changeovers[b] + [first_family(b) != f]``: the fixed
+    changeovers internal to the block, plus one boundary changeover unless
+    the block starts in the same family as the order before it.
+    """
+    size = 1 << m
     full = size - 1
     # dp[mask * num_families + f]
     dp = bytearray([INF]) * (size * num_families)
-    # Placing the first order costs nothing regardless of its family; the
-    # full-mask terminal value is 0 for every family (no orders left).
+    # No blocks left -> nothing remains to pay, for every tail family.
     for f in range(num_families):
         dp[full * num_families + f] = 0
 
     allbits = full
 
     for mask in range(full - 1, -1, -1):
-        # Orders that may be placed next: not yet placed, all prerequisites in.
+        # Blocks that may be placed next: not yet placed, all prerequisites in.
         avail = 0
         candidates = allbits ^ mask
         while candidates:
             lb = candidates & -candidates
-            j = lb.bit_length() - 1
-            if not (prereq[j] & ~mask):
+            b = lb.bit_length() - 1
+            if not (prereq_block[b] & ~mask):
                 avail |= lb
             candidates ^= lb
         if not avail:
             continue
 
-        # best_by_fam[f] = min dp(mask|{j}, family(j)) over available jobs j
-        # of family f.
+        # best_by_fam[f] = min entry cost of b + dp(mask|{b}, last_family(b))
+        # over available blocks b starting with family f.  The boundary
+        # changeover against the (not yet known) preceding family is added
+        # afterwards, outside the per-family minima.
         best_by_fam = [INF] * num_families
         candidates = avail
         while candidates:
             lb = candidates & -candidates
-            j = lb.bit_length() - 1
-            v = dp[(mask | lb) * num_families + family[j]]
-            if v < best_by_fam[family[j]]:
-                best_by_fam[family[j]] = v
+            b = lb.bit_length() - 1
+            nxt = dp[(mask | lb) * num_families + last_family[b]]
+            if nxt < INF:
+                v = nxt + block_entry_changeovers[b]
+                if v < best_by_fam[first_family[b]]:
+                    best_by_fam[first_family[b]] = v
             candidates ^= lb
-
         m1 = INF  # smallest family minimum
         m1_f = -1
         m2 = INF  # smallest family minimum coming from another family
@@ -150,23 +169,24 @@ def _optimal_order(
                 m2 = v
 
         # For each possible "last placed family" f:
-        #   dp(mask, f) = min over available j of
-        #                 dp(mask|{j}, family(j)) + [family(j) != f]
-        # = min(best_by_fam[f], min_from_another_family + 1).
+        #   dp(mask, f) = min over available b of
+        #       cost(b) + dp(mask|{b}, last_family(b))
+        #                     + [first_family(b) != f]
         base = mask * num_families
         for f in range(num_families):
             same = best_by_fam[f]
             other = m2 if f == m1_f else m1
             if other == INF:
-                # No available job from another family.
+                # No available block starting in another family.
                 dp[base + f] = same
             elif same == INF:
                 dp[base + f] = other + 1
             else:
                 dp[base + f] = same if same <= other + 1 else other + 1
 
-    # Greedy reconstruction with ascending UTF-8 id order.
-    ids_asc = list(range(n))
+    # Greedy reconstruction.  Blocks were built ordered by the UTF-8 byte
+    # order of their first job id, so trying indices ascending yields the
+    # lexicographically smallest job-id sequence among all optima.
     order: list[int] = []
     mask = 0
     last_f = -1
@@ -176,61 +196,73 @@ def _optimal_order(
         candidates = allbits ^ mask
         while candidates:
             lb = candidates & -candidates
-            j = lb.bit_length() - 1
-            if not (prereq[j] & ~mask):
+            b = lb.bit_length() - 1
+            if not (prereq_block[b] & ~mask):
                 avail |= lb
             candidates ^= lb
 
         if mask == 0:
-            # The first order never counts as a changeover; pick the smallest
-            # id that attains the overall DP optimum.  Bits are extracted low
-            # first, i.e. in ascending id order, so strict '<' keeps the
-            # smallest id on ties.
+            # The first block never pays a boundary changeover, so its total
+            # cost is its internal changeovers plus the successor state's
+            # optimum.  Find that overall optimum, then pick the smallest
+            # first-id block (blocks are indexed in that order) attaining it.
             best = INF
+            candidates = avail
+            while candidates:
+                lb = candidates & -candidates
+                b = lb.bit_length() - 1
+                nxt = dp[lb * num_families + last_family[b]]
+                if nxt < INF:
+                    v = nxt + block_entry_changeovers[b]
+                    if v < best:
+                        best = v
+                candidates ^= lb
             chosen = -1
             candidates = avail
             while candidates:
                 lb = candidates & -candidates
-                j = lb.bit_length() - 1
-                v = dp[lb * num_families + family[j]]
-                if v < best:
-                    best = v
-                    chosen = j
+                b = lb.bit_length() - 1
+                nxt = dp[lb * num_families + last_family[b]]
+                if (
+                    nxt < INF
+                    and nxt + block_entry_changeovers[b] == best
+                ):
+                    chosen = b
+                    remaining_cost = nxt
+                    break
                 candidates ^= lb
-            remaining_cost = best
         else:
             chosen = -1
-            for j in ids_asc:
-                if not (avail & (1 << j)):
+            for b in range(m):
+                if not (avail & (1 << b)):
                     continue
-                edge_cost = int(family[j] != last_f)
-                if (
-                    dp[(mask | (1 << j)) * num_families + family[j]]
-                    + edge_cost
-                    == remaining_cost
-                ):
-                    chosen = j
-                    remaining_cost -= edge_cost
+                nxt = dp[(mask | (1 << b)) * num_families + last_family[b]]
+                edge_cost = int(first_family[b] != last_f)
+                total = nxt + block_entry_changeovers[b] + edge_cost
+                if total == remaining_cost:
+                    chosen = b
+                    # The successor state's optimal remaining value is nxt.
+                    remaining_cost = nxt
                     break
-        if chosen < 0:  # pragma: no cover - cannot happen on a DAG
+        if chosen < 0:  # pragma: no cover - feasibility checked beforehand
             raise RuntimeError("DP reconstruction failed")
         order.append(chosen)
         mask |= 1 << chosen
-        last_f = family[chosen]
+        last_f = last_family[chosen]
     return order
 
 
 def solve(
     jobs: list[Job],
     edges: list[tuple[str, str]],
+    immediate: list[tuple[str, str]] | None = None,
 ) -> dict:
     """Compute the schedule payload.
 
-    Returns either::
+    Returns one of::
 
         {"status": "CYCLE", "cycle": [...]}
-
-    or::
+        {"status": "UNSCHEDULABLE"}
 
         {"status": "OK", "order": [...], "changeover_count": k,
          "changeover_positions": [...], "changeovers": [...]}
@@ -248,11 +280,105 @@ def solve(
     family_of_id = {j.id: j.family for j in jobs}
     family = [fam_idx[family_of_id[jid]] for jid in ids]
 
-    prereq = [0] * n
-    for before, after in edges:
-        prereq[idx[after]] |= 1 << idx[before]
+    immediate = immediate or []
 
-    seq = _optimal_order(n, family, len(family_names), prereq)
+    # Contract immediate pairs into fixed chains (blocks).  The request
+    # validator already guarantees in-degree <= 1, out-degree <= 1 and no
+    # duplicate pairs, so walking from every predecessor-free head either
+    # covers every job (disjoint chains) or finds an immediate-only cycle,
+    # including a self pair a -> a: no linear order can satisfy it.
+    succ: dict[str, str] = {}
+    has_pred: set[str] = set()
+    for before, after in immediate:
+        succ[before] = after
+        has_pred.add(after)
+
+    chains: list[list[int]] = []
+    visited = [False] * n
+    for head in ids:
+        if head in has_pred:
+            continue
+        chain: list[int] = []
+        cur: str | None = head
+        while cur is not None:
+            i = idx[cur]
+            if visited[i]:  # pragma: no cover - excluded by validation
+                break
+            visited[i] = True
+            chain.append(i)
+            cur = succ.get(cur)
+        chains.append(chain)
+    if not all(visited):
+        return {"status": "UNSCHEDULABLE"}
+
+    # Order blocks by the byte order of their first job id, so that the DP
+    # reconstruction's ascending-index tie-break gives the lex-smallest
+    # sequence of job ids.
+    chains.sort(key=lambda ch: ids[ch[0]].encode("utf-8"))
+    m = len(chains)
+    block_of = [-1] * n
+    pos_in_block = [-1] * n
+    for b, chain in enumerate(chains):
+        for p, i in enumerate(chain):
+            block_of[i] = b
+            pos_in_block[i] = p
+
+    first_family = [family[ch[0]] for ch in chains]
+    last_family = [family[ch[-1]] for ch in chains]
+    block_entry_changeovers = [
+        sum(
+            1 for p in range(1, len(ch)) if family[ch[p]] != family[ch[p - 1]]
+        )
+        for ch in chains
+    ]
+
+    # Turn ordinary precedence edges into block-level constraints.  An edge
+    # inside one block is satisfiable only when it follows the fixed chain
+    # direction; edges between blocks mean the source block must precede the
+    # target block.  A cycle among blocks cannot exist (the ordinary graph is
+    # a DAG) unless the immediate chains force one.
+    prereq_block = [0] * m
+    block_adj: list[list[int]] = [[] for _ in range(m)]
+    for before, after in edges:
+        u, v = idx[before], idx[after]
+        bu, bv = block_of[u], block_of[v]
+        if bu == bv:
+            if pos_in_block[u] >= pos_in_block[v]:
+                return {"status": "UNSCHEDULABLE"}
+            continue
+        bit = 1 << bu
+        if not (prereq_block[bv] & bit):
+            prereq_block[bv] |= bit
+            block_adj[bu].append(bv)
+
+    # Kahn's algorithm on the block graph: if it stalls, the immediate
+    # chains together with the precedence edges are contradictory.
+    indegree = [0] * m
+    for u in range(m):
+        for v in block_adj[u]:
+            indegree[v] += 1
+    ready = [b for b in range(m) if indegree[b] == 0]
+    seen_count = 0
+    while ready:
+        u = ready.pop()
+        seen_count += 1
+        for v in block_adj[u]:
+            indegree[v] -= 1
+            if indegree[v] == 0:
+                ready.append(v)
+    if seen_count != m:
+        return {"status": "UNSCHEDULABLE"}
+
+    block_seq = _optimal_block_order(
+        m,
+        first_family,
+        last_family,
+        len(family_names),
+        prereq_block,
+        block_entry_changeovers,
+    )
+
+    seq = [i for b in block_seq for i in chains[b]]
 
     order_ids = [ids[i] for i in seq]
     positions: list[int] = []

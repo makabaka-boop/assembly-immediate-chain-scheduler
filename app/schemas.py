@@ -46,11 +46,21 @@ class EdgeIn(BaseModel):
         return _ascii_nonempty(v, info.field_name)
 
 
+class ImmediateIn(EdgeIn):
+    """Directed pair demanding adjacent execution (``before`` right before ``after``).
+
+    Degree limits, unknown references and duplicates are validated on the
+    request; a self loop is left to the solver, which reports
+    ``UNSCHEDULABLE`` (no linear order can place a job adjacent to itself).
+    """
+
+
 class ScheduleRequest(BaseModel):
     model_config = pydantic.ConfigDict(extra="forbid")
 
     jobs: list[JobIn] = Field(..., min_length=MIN_JOBS, max_length=MAX_JOBS)
     edges: list[EdgeIn] = Field(default_factory=list)
+    immediate: list[ImmediateIn] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _validate(self) -> "ScheduleRequest":
@@ -72,4 +82,21 @@ class ScheduleRequest(BaseModel):
             if (before, after) in seen:
                 raise ValueError("duplicate edge")
             seen.add((before, after))
+
+        raw_immediate = [(p.before, p.after) for p in self.immediate]
+        seen_immediate: set[tuple[str, str]] = set()
+        has_predecessor: set[str] = set()
+        has_successor: set[str] = set()
+        for before, after in raw_immediate:
+            if before not in known or after not in known:
+                raise ValueError("immediate pair references unknown job id")
+            if (before, after) in seen_immediate:
+                raise ValueError("duplicate immediate pair")
+            if before in has_successor:
+                raise ValueError("job has more than one immediate successor")
+            if after in has_predecessor:
+                raise ValueError("job has more than one immediate predecessor")
+            seen_immediate.add((before, after))
+            has_successor.add(before)
+            has_predecessor.add(after)
         return self
